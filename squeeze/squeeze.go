@@ -6,8 +6,6 @@ import (
 	log "github.com/sirupsen/logrus"
 	"io"
 	"net"
-	"net/url"
-	"strconv"
 	"strings"
 )
 
@@ -20,6 +18,7 @@ func New(address string) Server {
 type Server struct {
 	address    string
 	chanNotify chan *Track
+	DefaultCurrentTitleParser
 }
 
 func (s *Server) Close() error {
@@ -105,258 +104,68 @@ func (s *Server) CurrentTrack(id PlayerId) (*Track, error) {
 	lms := bufio.NewReader(conn)
 	t := Track{}
 
-	err = s.fillArtist(conn, lms, id, &t)
-	if err != nil {
-		log.Warnf("unable to read artist field: %v", err)
-	}
-
-	err = s.fillAlbum(conn, lms, id, &t)
-	if err != nil {
-		log.Warnf("unable to read album field: %v", err)
-	}
-
-	err = s.fillTitle(conn, lms, id, &t)
-	if err != nil {
-		log.Warnf("unable to read title field: %v", err)
-	}
-
-	err = s.fillGenre(conn, lms, id, &t)
-	if err != nil {
-		log.Warnf("unable to read genre field: %v", err)
-	}
-
-	err = s.fillYear(conn, lms, id, &t)
-	if err != nil {
-		log.Warnf("invalid year field: %v", err)
-	}
-
-	err = s.fillDuration(conn, lms, id, &t)
-	if err != nil {
-		log.Warnf("unable to read duration field: %v", err)
-	}
-
-	err = s.fillTime(conn, lms, id, &t)
-	if err != nil {
-		log.Warnf("unable to read time field: %v", err)
-	}
-
-	return &t, nil
-}
-
-func (s *Server) currentTitle(writer io.Writer, reader *bufio.Reader, id PlayerId) (string, error) {
-	_, err := fmt.Fprintf(writer, "%s current_title ?\r\n", id)
-	if err != nil {
-		return "", fmt.Errorf("unable to fetch track title: %v", err)
-	}
-
-	rawLine, err := reader.ReadString('\n')
-	if err != nil {
-		return "", fmt.Errorf("unable to read response: %v", err)
-	}
-	line := strings.ReplaceAll(rawLine, "\n", "")
-	line = strings.ReplaceAll(line, "\r", "")
-	rawValue := strings.Split(line, " ")[2]
-	title, err := url.QueryUnescape(rawValue)
-	if err != nil {
-		return "", fmt.Errorf("unable to unescape title \"%v\": %v", rawValue, err)
-	}
-	return title, nil
-}
-
-func (s *Server) fillArtist(writer io.Writer, reader *bufio.Reader, id PlayerId, t *Track) error {
-	_, err := fmt.Fprintf(writer, "%s artist ?\r\n", id)
-	if err != nil {
-		return fmt.Errorf("unable to fetch track artist: %v", err)
-	}
-
-	rawLine, err := reader.ReadString('\n')
-	if err != nil {
-		return fmt.Errorf("unable to read response: %v", err)
-	}
-
-	line := strings.ReplaceAll(rawLine, "\n", "")
-	line = strings.ReplaceAll(line, "\r", "")
-	rawValues := strings.Split(line, " ")
-	if len(rawValues) < 3 {
-		log.Debugf("no artist metadata for current track")
-		return nil
-	}
-	rawValue := rawValues[2]
-	artist, err := url.QueryUnescape(rawValue)
-	if err != nil {
-		return fmt.Errorf("unable to unescape artist \"%v\": %v", rawValue, err)
-	}
-
-	t.Artist = artist
-	return nil
-}
-
-func (s *Server) fillAlbum(writer io.Writer, reader *bufio.Reader, id PlayerId, t *Track) error {
-	_, err := fmt.Fprintf(writer, "%s album ?\r\n", id)
-	if err != nil {
-		return fmt.Errorf("unable to fetch track album: %v", err)
-	}
-
-	rawLine, err := reader.ReadString('\n')
-	if err != nil {
-		return fmt.Errorf("unable to read response: %v", err)
-	}
-	line := strings.ReplaceAll(rawLine, "\n", "")
-	line = strings.ReplaceAll(line, "\r", "")
-	log.Debugf("parse raw album value '%v'", line)
-	rawValues := strings.Split(line, " ")
-	if len(rawValues) < 3 {
-		log.Debugf("no album metadata for current track")
-		return nil
-	}
-	rawValue := rawValues[2]
-	album, err := url.QueryUnescape(rawValue)
-	if err != nil {
-		return fmt.Errorf("unable to unescape album \"%v\": %v", rawValue, err)
-	}
-
-	currentTitle, err := s.currentTitle(writer, reader, id)
+	currentTitle, err := s.CurrentTitle(conn, lms, id)
 	if err != nil {
 		log.Warnf("unable to read current_title field: %v", err)
 	}
+
+	var mp MetadataParser
 	if strings.Index(currentTitle, "fip") == 0 || strings.Index(currentTitle, "FIP") == 0 {
-		log.Debugf("search year in album '%v'", album)
-		fields := strings.Split(album, "/")
-		if len(fields) >= 2 {
-			year, err := strconv.Atoi(strings.TrimSpace(fields[len(fields)-1]))
-			if err != nil {
-				log.Warnf("unable to parse year in album value \"%v\": %v", album, err)
-			} else {
-				log.Debugf("find year value '%v'", year)
-				t.Year = year
-			}
-			album = strings.TrimSpace(strings.Join(fields[:len(fields)-1], "/"))
-		}
+		mp = RadioFranceParser{}
+	} else {
+		mp = DefaultParser{}
 	}
-	log.Debugf("find album '%v'", album)
-	t.Album = album
-	return nil
-}
 
-func (s *Server) fillTitle(writer io.Writer, reader *bufio.Reader, id PlayerId, t *Track) error {
-	_, err := fmt.Fprintf(writer, "%s title ?\r\n", id)
+	artist, err := mp.Artist(conn, lms, id)
 	if err != nil {
-		return fmt.Errorf("unable to fetch track title: %v", err)
+		log.Warnf("unable to read artist field: %v", err)
+	} else {
+		t.Artist = artist
 	}
 
-	rawLine, err := reader.ReadString('\n')
+	album, err := mp.Album(conn, lms, id)
 	if err != nil {
-		return fmt.Errorf("unable to read response: %v", err)
+		log.Warnf("unable to read album field: %v", err)
+	} else {
+		t.Album = album
 	}
-	line := strings.ReplaceAll(rawLine, "\n", "")
-	line = strings.ReplaceAll(line, "\r", "")
-	rawValue := strings.Split(line, " ")[2]
-	title, err := url.QueryUnescape(rawValue)
+
+	title, err := mp.Title(conn, lms, id)
 	if err != nil {
-		return fmt.Errorf("unable to unescape title \"%v\": %v", rawValue, err)
+		log.Warnf("unable to read title field: %v", err)
+	} else {
+		t.Title = title
 	}
 
-	t.Title = title
-	return nil
-}
-
-func (s *Server) fillGenre(writer io.Writer, reader *bufio.Reader, id PlayerId, t *Track) error {
-	_, err := fmt.Fprintf(writer, "%s genre ?\r\n", id)
+	genre, err := mp.Genre(conn, lms, id)
 	if err != nil {
-		return fmt.Errorf("unable to fetch track genre: %v", err)
+		log.Warnf("unable to read genre field: %v", err)
+	} else {
+		t.Genre = genre
 	}
 
-	rawLine, err := reader.ReadString('\n')
+	year, err := mp.Year(conn, lms, id)
 	if err != nil {
-		return fmt.Errorf("unable to read response: %v", err)
+		log.Warnf("invalid year field: %v", err)
+	} else if year > 0 {
+		t.Year = year
 	}
-	line := strings.ReplaceAll(rawLine, "\n", "")
-	line = strings.ReplaceAll(line, "\r", "")
-	rawValues := strings.Split(line, " ")
-	if len(rawValues) < 3 {
-		log.Debugf("no genre metadata for current track")
-		return nil
-	}
-	rawValue := rawValues[2]
-	genre, err := url.QueryUnescape(rawValue)
+
+	d, err := mp.Duration(conn, lms, id)
 	if err != nil {
-		return fmt.Errorf("unable to unescape genre \"%v\": %v", rawValue, err)
+		log.Warnf("unable to read duration field: %v", err)
+	} else if d != NilTrackDuration {
+		t.Duration = float64(d)
 	}
 
-	t.Genre = genre
-	return nil
-}
-
-func (s *Server) fillYear(writer io.Writer, reader *bufio.Reader, id PlayerId, t *Track) error {
-	_, err := fmt.Fprintf(writer, "%s year ?\r\n", id)
+	tm, err := mp.Time(conn, lms, id)
 	if err != nil {
-		return fmt.Errorf("unable to fetch track year: %v", err)
+		log.Warnf("unable to read time field: %v", err)
+	} else if tm != NilTrackTime {
+		t.CurrentTime = float64(tm)
 	}
 
-	rawLine, err := reader.ReadString('\n')
-	if err != nil {
-		return fmt.Errorf("unable to read response: %v", err)
-	}
-
-	line := strings.ReplaceAll(rawLine, "\n", "")
-	line = strings.ReplaceAll(line, "\r", "")
-	rawValue := strings.Split(line, " ")[2]
-	rawYear, err := url.QueryUnescape(rawValue)
-	if err != nil {
-		return fmt.Errorf("unable to unescape year \"%v\": %v", rawValue, err)
-	}
-
-	year, err := strconv.Atoi(strings.Trim(rawYear, "\r"))
-	if err != nil {
-		return fmt.Errorf("unable to parse year value \"%v\": %v", rawLine, err)
-	}
-	t.Year = year
-	return nil
-}
-
-func (s *Server) fillDuration(writer io.Writer, reader *bufio.Reader, id PlayerId, t *Track) error {
-	_, err := fmt.Fprintf(writer, "%s duration ?\r\n", id)
-	if err != nil {
-		return fmt.Errorf("unable to fetch track duration: %v", err)
-	}
-
-	rawLine, err := reader.ReadString('\n')
-	if err != nil {
-		return fmt.Errorf("unable to read response: %v", err)
-	}
-	line := strings.ReplaceAll(rawLine, "\n", "")
-	line = strings.ReplaceAll(line, "\r", "")
-	rawValue := strings.Split(line, " ")[2]
-
-	d, err := strconv.ParseFloat(strings.Trim(rawValue, "\r"), 64)
-	if err != nil {
-		return fmt.Errorf("unable to parse duration value \"%v\": %v", rawLine, err)
-	}
-	t.Duration = d
-	return nil
-}
-
-func (s *Server) fillTime(writer io.Writer, reader *bufio.Reader, id PlayerId, t *Track) error {
-	_, err := fmt.Fprintf(writer, "%s time ?\r\n", id)
-	if err != nil {
-		return fmt.Errorf("unable to fetch track current time: %v", err)
-	}
-
-	rawLine, err := reader.ReadString('\n')
-	if err != nil {
-		return fmt.Errorf("unable to read response: %v", err)
-	}
-
-	line := strings.ReplaceAll(rawLine, "\n", "")
-	line = strings.ReplaceAll(line, "\r", "")
-	rawValue := strings.Split(line, " ")[2]
-
-	tm, err := strconv.ParseFloat(strings.Trim(rawValue, "\r"), 64)
-	if err != nil {
-		return fmt.Errorf("unable to parse time value \"%v\": %v", rawLine, err)
-	}
-	t.CurrentTime = tm
-	return nil
+	return &t, nil
 }
 
 func (s *Server) onNewMetadata(line string) {
